@@ -1,0 +1,12 @@
+{
+    "java.project.sourcePaths": [
+        "src"
+    ],
+    "java.project.outputPath": "bin",
+    "java.project.referencedLibraries": [
+        "lib\\mysql-connector-j-9.1.0.jar",
+        "c:\\Users\\peete\\Downloads\\mysql-connector-j-9.1.0\\mysql-connector-j-9.1.0\\mysql-connector-j-9.1.0.jar",
+        "lib\\twilio-10.6.3-jar-with-dependencies.jar",
+        "test-lib\\\\*.jar"
+    ]
+}
