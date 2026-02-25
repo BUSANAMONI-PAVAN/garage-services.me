@@ -131,7 +131,7 @@ export default function Settings() {
   const sendFeedback = useMutation({
     mutationFn: (data: FeedbackData) =>
       feedbackApi.submit({
-        customer_name: data.customerName,
+        customerName: data.customerName,
         email: data.email,
         rating: data.rating,
         comments: data.comments,
