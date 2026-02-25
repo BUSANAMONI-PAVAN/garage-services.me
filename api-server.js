@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
@@ -32,30 +31,53 @@ function loadEnv() {
 loadEnv();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'garage-services-secret-key-2026';
-const PORT = process.env.API_PORT || 5000;
+const PORT = process.env.PORT || process.env.API_PORT || 5000;
 const portFile = path.join(__dirname, '.server-port');
 const pidFile = path.join(__dirname, '.server-pid');
 
-// ── MySQL Pool ─────────────────────────────────────────────
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  port: parseInt(process.env.DB_PORT || '3306'),
-  user: process.env.JAVA_DB_USER || process.env.DB_USER || 'root',
-  password: process.env.JAVA_DB_PASSWORD || process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'garage',
-  waitForConnections: true,
-  connectionLimit: 10,
-});
+// ── Database (PostgreSQL on Render, MySQL locally) ─────────
+const isPostgres = !!process.env.DATABASE_URL;
+let dbPool;
+
+if (isPostgres) {
+  const { Pool } = require('pg');
+  dbPool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+  });
+} else {
+  const mysql = require('mysql2/promise');
+  dbPool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '3306'),
+    user: process.env.JAVA_DB_USER || process.env.DB_USER || 'root',
+    password: process.env.JAVA_DB_PASSWORD || process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'garage',
+    waitForConnections: true,
+    connectionLimit: 10,
+  });
+}
+
+// Universal query wrapper: converts MySQL ? placeholders to PostgreSQL $1,$2,...
+async function db(sql, params = []) {
+  if (isPostgres) {
+    let idx = 0;
+    const pgSql = sql.replace(/\?/g, () => `$${++idx}`);
+    const result = await dbPool.query(pgSql, params);
+    return [result.rows, result];
+  }
+  return dbPool.query(sql, params);
+}
 
 // ── Nodemailer ─────────────────────────────────────────────
 function getMailTransporter() {
   return nodemailer.createTransport({
-    host: process.env.JAVA_SMTP_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.JAVA_SMTP_PORT || '587'),
+    host: process.env.SMTP_HOST || process.env.JAVA_SMTP_HOST || 'smtp-relay.brevo.com',
+    port: parseInt(process.env.SMTP_PORT || process.env.JAVA_SMTP_PORT || '587'),
     secure: false,
     auth: {
-      user: process.env.JAVA_SMTP_USER || 'endless.candate@gmail.com',
-      pass: process.env.JAVA_SMTP_PASS || '',
+      user: process.env.SMTP_USER || process.env.JAVA_SMTP_USER || '',
+      pass: process.env.SMTP_PASS || process.env.JAVA_SMTP_PASS || '',
     },
   });
 }
@@ -64,7 +86,7 @@ async function sendMail(to, subject, html) {
   try {
     const t = getMailTransporter();
     await t.sendMail({
-      from: `"Garage Services" <${process.env.JAVA_SMTP_USER || 'endless.candate@gmail.com'}>`,
+      from: `"Garage Services" <${process.env.SMTP_USER || process.env.JAVA_SMTP_USER || 'noreply@garage-services.me'}>`,
       to, subject, html,
     });
     return true;
@@ -82,7 +104,7 @@ function generateOTP() {
 async function sendOTP(email, otp) {
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
-      <h2 style="color:#1e40af;margin-bottom:8px">🔧 Garage Services</h2>
+      <h2 style="color:#1e40af;margin-bottom:8px">Garage Services</h2>
       <p style="color:#4b5563">Your One-Time Password is:</p>
       <div style="text-align:center;margin:24px 0">
         <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:#1e40af;background:#eff6ff;padding:16px 32px;border-radius:12px;display:inline-block">${otp}</span>
@@ -100,7 +122,7 @@ async function generateOrderId() {
     String(today.getMonth() + 1).padStart(2, '0') +
     String(today.getDate()).padStart(2, '0');
   const prefix = `GS-${dateStr}-`;
-  const [rows] = await pool.query(
+  const [rows] = await db(
     "SELECT order_id FROM GarageServiceBookings WHERE order_id LIKE ? ORDER BY order_id DESC LIMIT 1",
     [`${prefix}%`]
   );
@@ -113,8 +135,114 @@ async function generateOrderId() {
   return `${prefix}${String(seq).padStart(3, '0')}`;
 }
 
+// ── Initialize all tables (PostgreSQL) ─────────────────────
+async function initPostgresTables() {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS Users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(50) UNIQUE,
+      password VARCHAR(255),
+      full_name VARCHAR(100) NOT NULL,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      phone VARCHAR(20),
+      role VARCHAR(20) NOT NULL DEFAULT 'Customer',
+      approval_status VARCHAR(20) DEFAULT NULL,
+      otp VARCHAR(10),
+      otp_expires TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS GarageServiceBookings (
+      id SERIAL PRIMARY KEY,
+      user_id INT REFERENCES Users(id) ON DELETE SET NULL,
+      order_id VARCHAR(50),
+      name VARCHAR(100) NOT NULL,
+      email VARCHAR(255) NOT NULL,
+      phone VARCHAR(20),
+      wheeler_type VARCHAR(20) NOT NULL,
+      service_type VARCHAR(50) DEFAULT 'Standard',
+      cost DOUBLE PRECISION NOT NULL,
+      appointment_date TIMESTAMP,
+      status VARCHAR(20) DEFAULT 'Pending',
+      notes TEXT,
+      assigned_worker_id INT REFERENCES Users(id) ON DELETE SET NULL,
+      booking_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS Notifications (
+      id SERIAL PRIMARY KEY,
+      user_id INT NOT NULL REFERENCES Users(id) ON DELETE CASCADE,
+      booking_id INT REFERENCES GarageServiceBookings(id) ON DELETE SET NULL,
+      type VARCHAR(50) NOT NULL DEFAULT 'General',
+      title VARCHAR(255) NOT NULL,
+      message TEXT NOT NULL,
+      actor_id INT REFERENCES Users(id) ON DELETE SET NULL,
+      is_read SMALLINT NOT NULL DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE INDEX IF NOT EXISTS idx_notifications_user_read
+    ON Notifications (user_id, is_read, created_at)
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS CustomerFeedback (
+      id SERIAL PRIMARY KEY,
+      user_id INT REFERENCES Users(id) ON DELETE SET NULL,
+      name VARCHAR(100),
+      feedback_text TEXT NOT NULL,
+      rating INT CHECK (rating BETWEEN 1 AND 5),
+      feedback_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS Settings (
+      id SERIAL PRIMARY KEY,
+      setting_key VARCHAR(100) UNIQUE NOT NULL,
+      setting_value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // Insert default settings
+  const defaults = [
+    ['two_wheeler_cost', '500'],
+    ['three_wheeler_cost', '750'],
+    ['four_wheeler_cost', '1000'],
+    ['premium_discount', '10'],
+    ['business_name', 'Premium Garage Services'],
+    ['business_email', 'contact@garageservices.com'],
+    ['business_phone', '+1-234-567-8900'],
+  ];
+  for (const [key, value] of defaults) {
+    await dbPool.query(
+      `INSERT INTO Settings (setting_key, setting_value) VALUES ($1, $2) ON CONFLICT (setting_key) DO NOTHING`,
+      [key, value]
+    );
+  }
+
+  // Create default manager account if none exists
+  const { rows: managers } = await dbPool.query(`SELECT id FROM Users WHERE role = 'Manager' LIMIT 1`);
+  if (managers.length === 0) {
+    const hashedPw = await bcrypt.hash('admin123', 10);
+    await dbPool.query(
+      `INSERT INTO Users (username, password, full_name, email, role) VALUES ($1, $2, $3, $4, $5)`,
+      ['admin', hashedPw, 'Admin Manager', 'admin@garage-services.me', 'Manager']
+    );
+    console.log('  Default manager created: username=admin, password=admin123');
+  }
+}
+
 async function ensureNotificationsTable() {
-  await pool.query(`
+  if (isPostgres) return; // Already handled by initPostgresTables
+  await db(`
     CREATE TABLE IF NOT EXISTS Notifications (
       id INT AUTO_INCREMENT PRIMARY KEY,
       user_id INT NOT NULL,
@@ -135,7 +263,7 @@ async function ensureNotificationsTable() {
 
 async function getUserDisplayName(userId, fallback = 'User') {
   try {
-    const [rows] = await pool.query(
+    const [rows] = await db(
       'SELECT full_name, username, email FROM Users WHERE id = ? LIMIT 1',
       [userId]
     );
@@ -149,7 +277,7 @@ async function getUserDisplayName(userId, fallback = 'User') {
 async function createNotification({ userId, bookingId = null, type = 'General', title, message, actorId = null }) {
   if (!userId || !title || !message) return;
   try {
-    await pool.query(
+    await db(
       'INSERT INTO Notifications (user_id, booking_id, type, title, message, actor_id) VALUES (?, ?, ?, ?, ?, ?)',
       [userId, bookingId, type, title, message, actorId]
     );
@@ -207,16 +335,16 @@ app.post('/api/auth/customer/request-otp', async (req, res) => {
     const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 min
 
     // Check if customer exists
-    const [rows] = await pool.query('SELECT id FROM Users WHERE email = ? AND role = "Customer"', [email]);
+    const [rows] = await db('SELECT id FROM Users WHERE email = ? AND role = \'Customer\'', [email]);
 
     if (rows.length === 0) {
       // Auto-create customer account (no password)
-      await pool.query(
-        'INSERT INTO Users (email, full_name, role, otp, otp_expires) VALUES (?, ?, "Customer", ?, ?)',
+      await db(
+        'INSERT INTO Users (email, full_name, role, otp, otp_expires) VALUES (?, ?, \'Customer\', ?, ?)',
         [email, email.split('@')[0], otp, otpExpires]
       );
     } else {
-      await pool.query('UPDATE Users SET otp = ?, otp_expires = ? WHERE email = ? AND role = "Customer"', [otp, otpExpires, email]);
+      await db('UPDATE Users SET otp = ?, otp_expires = ? WHERE email = ? AND role = \'Customer\'', [otp, otpExpires, email]);
     }
 
     const sent = await sendOTP(email, otp);
@@ -235,15 +363,15 @@ app.post('/api/auth/customer/verify-otp', async (req, res) => {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ error: 'Email and OTP are required' });
 
-    const [rows] = await pool.query(
-      'SELECT * FROM Users WHERE email = ? AND role = "Customer" AND otp = ? AND otp_expires > NOW()',
+    const [rows] = await db(
+      'SELECT * FROM Users WHERE email = ? AND role = \'Customer\' AND otp = ? AND otp_expires > NOW()',
       [email, otp]
     );
     if (rows.length === 0) return res.status(401).json({ error: 'Invalid or expired OTP' });
 
     const user = rows[0];
     // Clear OTP after use
-    await pool.query('UPDATE Users SET otp = NULL, otp_expires = NULL WHERE id = ?', [user.id]);
+    await db('UPDATE Users SET otp = NULL, otp_expires = NULL WHERE id = ?', [user.id]);
 
     const token = jwt.sign({ id: user.id, email: user.email, role: 'Customer' }, JWT_SECRET, { expiresIn: '7d' });
     res.json({
@@ -263,7 +391,7 @@ app.post('/api/auth/worker/register', async (req, res) => {
     if (!email || !fullName || !password) return res.status(400).json({ error: 'Email, full name and password are required' });
 
     // Check duplicate email
-    const [existing] = await pool.query('SELECT id FROM Users WHERE email = ?', [email]);
+    const [existing] = await db('SELECT id FROM Users WHERE email = ?', [email]);
     if (existing.length > 0) return res.status(409).json({ error: 'Email already registered' });
 
     // Send OTP first for email verification
@@ -271,8 +399,8 @@ app.post('/api/auth/worker/register', async (req, res) => {
     const otpExpires = new Date(Date.now() + 10 * 60 * 1000);
     const hashedPw = await bcrypt.hash(password, 10);
 
-    await pool.query(
-      'INSERT INTO Users (email, full_name, phone, password, role, approval_status, otp, otp_expires) VALUES (?, ?, ?, ?, "Worker", "Pending", ?, ?)',
+    await db(
+      'INSERT INTO Users (email, full_name, phone, password, role, approval_status, otp, otp_expires) VALUES (?, ?, ?, ?, \'Worker\', \'Pending\', ?, ?)',
       [email, fullName, phone || null, hashedPw, otp, otpExpires]
     );
 
@@ -292,14 +420,14 @@ app.post('/api/auth/worker/verify-otp', async (req, res) => {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ error: 'Email and OTP are required' });
 
-    const [rows] = await pool.query(
-      'SELECT * FROM Users WHERE email = ? AND role = "Worker" AND otp = ? AND otp_expires > NOW()',
+    const [rows] = await db(
+      'SELECT * FROM Users WHERE email = ? AND role = \'Worker\' AND otp = ? AND otp_expires > NOW()',
       [email, otp]
     );
     if (rows.length === 0) return res.status(401).json({ error: 'Invalid or expired OTP' });
 
     // Clear OTP
-    await pool.query('UPDATE Users SET otp = NULL, otp_expires = NULL WHERE id = ?', [rows[0].id]);
+    await db('UPDATE Users SET otp = NULL, otp_expires = NULL WHERE id = ?', [rows[0].id]);
 
     res.json({ message: 'Email verified. Your account is pending manager approval.' });
   } catch (err) {
@@ -314,7 +442,7 @@ app.post('/api/auth/worker/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
 
-    const [rows] = await pool.query('SELECT * FROM Users WHERE email = ? AND role = "Worker"', [email]);
+    const [rows] = await db('SELECT * FROM Users WHERE email = ? AND role = \'Worker\'', [email]);
     if (rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
 
     const user = rows[0];
@@ -342,7 +470,7 @@ app.post('/api/auth/manager/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
 
-    const [rows] = await pool.query('SELECT * FROM Users WHERE username = ? AND role = "Manager"', [username]);
+    const [rows] = await db('SELECT * FROM Users WHERE username = ? AND role = \'Manager\'', [username]);
     if (rows.length === 0) return res.status(401).json({ error: 'Invalid credentials' });
 
     const user = rows[0];
@@ -363,7 +491,7 @@ app.post('/api/auth/manager/login', async (req, res) => {
 // ── Get current user ───────────────────────────────────────
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT id, username, email, full_name, phone, role, approval_status FROM Users WHERE id = ?', [req.user.id]);
+    const [rows] = await db('SELECT id, username, email, full_name, phone, role, approval_status FROM Users WHERE id = ?', [req.user.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'User not found' });
     const u = rows[0];
     res.json({ id: u.id, username: u.username, email: u.email, fullName: u.full_name, phone: u.phone, role: u.role, approvalStatus: u.approval_status });
@@ -378,7 +506,7 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
     const rawLimit = parseInt(req.query.limit, 10);
     const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 50) : 20;
 
-    const [rows] = await pool.query(
+    const [rows] = await db(
       `SELECT n.*, b.order_id, b.status AS booking_status
        FROM Notifications n
        LEFT JOIN GarageServiceBookings b ON n.booking_id = b.id
@@ -388,14 +516,14 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
       [req.user.id, limit]
     );
 
-    const [unreadRows] = await pool.query(
+    const [unreadRows] = await db(
       'SELECT COUNT(*) AS unread FROM Notifications WHERE user_id = ? AND is_read = 0',
       [req.user.id]
     );
 
     res.json({
       items: rows,
-      unread: unreadRows[0]?.unread || 0,
+      unread: Number(unreadRows[0]?.unread) || 0,
     });
   } catch (err) {
     console.error('List notifications error:', err);
@@ -405,7 +533,7 @@ app.get('/api/notifications', authMiddleware, async (req, res) => {
 
 app.patch('/api/notifications/read-all', authMiddleware, async (req, res) => {
   try {
-    await pool.query('UPDATE Notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0', [req.user.id]);
+    await db('UPDATE Notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0', [req.user.id]);
     res.json({ message: 'All notifications marked as read' });
   } catch (err) {
     console.error('Read all notifications error:', err);
@@ -420,7 +548,7 @@ app.patch('/api/notifications/:id/read', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Invalid notification id' });
     }
 
-    await pool.query(
+    await db(
       'UPDATE Notifications SET is_read = 1 WHERE id = ? AND user_id = ?',
       [notificationId, req.user.id]
     );
@@ -449,25 +577,25 @@ app.get('/api/dashboard', authMiddleware, async (req, res) => {
     }
     // Manager sees everything (no WHERE)
 
-    const [totalRows] = await pool.query(`SELECT COUNT(*) as total FROM GarageServiceBookings ${whereClause}`, params);
-    const [revenueRows] = await pool.query(`SELECT COALESCE(SUM(cost), 0) as revenue FROM GarageServiceBookings ${whereClause}`, params);
-    const [pendingRows] = await pool.query(`SELECT COUNT(*) as pending FROM GarageServiceBookings ${whereClause ? whereClause + ' AND' : 'WHERE'} status = 'Pending'`, params);
-    const [completedRows] = await pool.query(`SELECT COUNT(*) as completed FROM GarageServiceBookings ${whereClause ? whereClause + ' AND' : 'WHERE'} status = 'Completed'`, params);
+    const [totalRows] = await db(`SELECT COUNT(*) as total FROM GarageServiceBookings ${whereClause}`, params);
+    const [revenueRows] = await db(`SELECT COALESCE(SUM(cost), 0) as revenue FROM GarageServiceBookings ${whereClause}`, params);
+    const [pendingRows] = await db(`SELECT COUNT(*) as pending FROM GarageServiceBookings ${whereClause ? whereClause + ' AND' : 'WHERE'} status = 'Pending'`, params);
+    const [completedRows] = await db(`SELECT COUNT(*) as completed FROM GarageServiceBookings ${whereClause ? whereClause + ' AND' : 'WHERE'} status = 'Completed'`, params);
     const dashWhere = whereClause.replace(/\buser_id\b/g, 'b.user_id').replace(/\bassigned_worker_id\b/g, 'b.assigned_worker_id');
-    const [recent] = await pool.query(`SELECT b.*, w.full_name AS assigned_worker_name FROM GarageServiceBookings b LEFT JOIN Users w ON b.assigned_worker_id = w.id ${dashWhere} ORDER BY b.booking_date DESC LIMIT 5`, params);
+    const [recent] = await db(`SELECT b.*, w.full_name AS assigned_worker_name FROM GarageServiceBookings b LEFT JOIN Users w ON b.assigned_worker_id = w.id ${dashWhere} ORDER BY b.booking_date DESC LIMIT 5`, params);
 
     // Service summary
-    const [serviceSummary] = await pool.query(
+    const [serviceSummary] = await db(
       `SELECT service_type, COUNT(*) as count FROM GarageServiceBookings ${whereClause} GROUP BY service_type ORDER BY count DESC LIMIT 5`,
       params
     );
 
     res.json({
       stats: {
-        total: totalRows[0].total,
-        revenue: revenueRows[0].revenue,
-        pending: pendingRows[0].pending,
-        completed: completedRows[0].completed,
+        total: Number(totalRows[0].total),
+        revenue: Number(revenueRows[0].revenue),
+        pending: Number(pendingRows[0].pending),
+        completed: Number(completedRows[0].completed),
       },
       recentBookings: recent,
       serviceSummary,
@@ -513,7 +641,7 @@ app.get('/api/bookings', authMiddleware, async (req, res) => {
     if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
     sql += ' ORDER BY b.booking_date DESC';
 
-    const [rows] = await pool.query(sql, params);
+    const [rows] = await db(sql, params);
     res.json(rows);
   } catch (err) {
     console.error('List bookings error:', err);
@@ -531,14 +659,24 @@ app.post('/api/bookings', authMiddleware, async (req, res) => {
 
     const orderId = await generateOrderId();
 
-    const [result] = await pool.query(
-      'INSERT INTO GarageServiceBookings (user_id, name, email, phone, wheeler_type, service_type, cost, appointment_date, notes, status, order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Pending", ?)',
-      [req.user.id, name, email, phone || null, wheelerType, serviceType || 'Standard', cost, appointmentDate || null, notes || null, orderId]
-    );
+    let insertedId;
+    if (isPostgres) {
+      const { rows: inserted } = await dbPool.query(
+        'INSERT INTO GarageServiceBookings (user_id, name, email, phone, wheeler_type, service_type, cost, appointment_date, notes, status, order_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \'Pending\', $10) RETURNING id',
+        [req.user.id, name, email, phone || null, wheelerType, serviceType || 'Standard', cost, appointmentDate || null, notes || null, orderId]
+      );
+      insertedId = inserted[0].id;
+    } else {
+      const [result] = await db(
+        'INSERT INTO GarageServiceBookings (user_id, name, email, phone, wheeler_type, service_type, cost, appointment_date, notes, status, order_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "Pending", ?)',
+        [req.user.id, name, email, phone || null, wheelerType, serviceType || 'Standard', cost, appointmentDate || null, notes || null, orderId]
+      );
+      insertedId = result.insertId;
+    }
 
     await createNotification({
       userId: req.user.id,
-      bookingId: result.insertId,
+      bookingId: insertedId,
       type: 'BookingCreated',
       title: `Booking submitted: ${orderId}`,
       message: `We received your ${serviceType || 'Service'} request for your ${wheelerType}. Watch for assignment and status updates here.`,
@@ -548,13 +686,13 @@ app.post('/api/bookings', authMiddleware, async (req, res) => {
     // Send confirmation email
     const bookingHtml = `
       <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
-        <h2 style="color:#1e40af">🔧 Booking Confirmed</h2>
+        <h2 style="color:#1e40af">Booking Confirmed</h2>
         <p>Hi <b>${name}</b>, your service booking has been received!</p>
         <table style="width:100%;border-collapse:collapse;margin:16px 0">
           <tr><td style="padding:8px;color:#6b7280">Order ID</td><td style="padding:8px;font-weight:600;color:#1e40af">${orderId}</td></tr>
           <tr><td style="padding:8px;color:#6b7280">Service</td><td style="padding:8px;font-weight:600">${serviceType || 'Standard'}</td></tr>
           <tr><td style="padding:8px;color:#6b7280">Vehicle</td><td style="padding:8px;font-weight:600">${wheelerType}</td></tr>
-          <tr><td style="padding:8px;color:#6b7280">Cost</td><td style="padding:8px;font-weight:600">₹${cost}</td></tr>
+          <tr><td style="padding:8px;color:#6b7280">Cost</td><td style="padding:8px;font-weight:600">Rs.${cost}</td></tr>
           <tr><td style="padding:8px;color:#6b7280">Status</td><td style="padding:8px;font-weight:600;color:#f59e0b">Pending</td></tr>
         </table>
         <p style="color:#6b7280;font-size:14px">We'll notify you of any updates.</p>
@@ -562,7 +700,7 @@ app.post('/api/bookings', authMiddleware, async (req, res) => {
     `;
     sendMail(email, 'Booking Confirmation — Garage Services', bookingHtml);
 
-    const [booking] = await pool.query('SELECT * FROM GarageServiceBookings WHERE id = ?', [result.insertId]);
+    const [booking] = await db('SELECT * FROM GarageServiceBookings WHERE id = ?', [insertedId]);
     res.status(201).json(booking[0]);
   } catch (err) {
     console.error('Create booking error:', err);
@@ -577,14 +715,14 @@ app.patch('/api/bookings/:id/status', authMiddleware, requireRole('Worker', 'Man
     const validStatuses = ['Pending', 'Confirmed', 'In Progress', 'Completed', 'Cancelled'];
     if (!validStatuses.includes(status)) return res.status(400).json({ error: 'Invalid status' });
 
-    const [beforeRows] = await pool.query('SELECT * FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
+    const [beforeRows] = await db('SELECT * FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
     if (beforeRows.length === 0) return res.status(404).json({ error: 'Booking not found' });
 
     const beforeBooking = beforeRows[0];
     const previousStatus = beforeBooking.status || 'Pending';
 
-    await pool.query('UPDATE GarageServiceBookings SET status = ? WHERE id = ?', [status, req.params.id]);
-    const [rows] = await pool.query(
+    await db('UPDATE GarageServiceBookings SET status = ? WHERE id = ?', [status, req.params.id]);
+    const [rows] = await db(
       'SELECT b.*, w.full_name AS assigned_worker_name FROM GarageServiceBookings b LEFT JOIN Users w ON b.assigned_worker_id = w.id WHERE b.id = ?',
       [req.params.id]
     );
@@ -595,7 +733,7 @@ app.patch('/api/bookings/:id/status', authMiddleware, requireRole('Worker', 'Man
     const statusColors = { Pending: '#f59e0b', Confirmed: '#3b82f6', 'In Progress': '#8b5cf6', Completed: '#10b981', Cancelled: '#ef4444' };
     sendMail(booking.email, `${booking.order_id || 'Booking #' + booking.id} — ${status}`, `
       <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
-        <h2 style="color:#1e40af">🔧 Booking Update</h2>
+        <h2 style="color:#1e40af">Booking Update</h2>
         <p>Hi <b>${booking.name}</b>, your booking <b style="color:#1e40af">${booking.order_id || '#' + booking.id}</b> status has been updated:</p>
         <p style="text-align:center;margin:20px 0"><span style="font-size:20px;font-weight:700;color:${statusColors[status] || '#1e40af'};background:#f3f4f6;padding:12px 24px;border-radius:12px">${status}</span></p>
       </div>
@@ -603,7 +741,6 @@ app.patch('/api/bookings/:id/status', authMiddleware, requireRole('Worker', 'Man
 
     const actorName = await getUserDisplayName(req.user.id, req.user.role);
     if (booking.user_id && previousStatus !== status) {
-      const actorName = await getUserDisplayName(req.user.id, req.user.role);
       const orderLabel = booking.order_id || `#${booking.id}`;
       await createNotification({
         userId: booking.user_id,
@@ -639,9 +776,9 @@ app.patch('/api/bookings/:id/status', authMiddleware, requireRole('Worker', 'Man
 // ── Delete booking (Workers & Managers only) ───────────────
 app.delete('/api/bookings/:id', authMiddleware, requireRole('Worker', 'Manager'), async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
+    const [rows] = await db('SELECT * FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Booking not found' });
-    await pool.query('DELETE FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
+    await db('DELETE FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
     res.json({ message: 'Booking deleted' });
   } catch (err) {
     console.error('Delete booking error:', err);
@@ -658,13 +795,13 @@ app.patch('/api/bookings/:id/assign', authMiddleware, requireRole('Manager'), as
       return res.status(400).json({ error: 'Invalid worker id' });
     }
 
-    const [beforeRows] = await pool.query('SELECT * FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
+    const [beforeRows] = await db('SELECT * FROM GarageServiceBookings WHERE id = ?', [req.params.id]);
     if (beforeRows.length === 0) return res.status(404).json({ error: 'Booking not found' });
     const beforeBooking = beforeRows[0];
     const previousWorkerId = beforeBooking.assigned_worker_id ? Number(beforeBooking.assigned_worker_id) : null;
 
-    await pool.query('UPDATE GarageServiceBookings SET assigned_worker_id = ? WHERE id = ?', [nextWorkerId, req.params.id]);
-    const [rows] = await pool.query('SELECT b.*, w.full_name AS assigned_worker_name FROM GarageServiceBookings b LEFT JOIN Users w ON b.assigned_worker_id = w.id WHERE b.id = ?', [req.params.id]);
+    await db('UPDATE GarageServiceBookings SET assigned_worker_id = ? WHERE id = ?', [nextWorkerId, req.params.id]);
+    const [rows] = await db('SELECT b.*, w.full_name AS assigned_worker_name FROM GarageServiceBookings b LEFT JOIN Users w ON b.assigned_worker_id = w.id WHERE b.id = ?', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'Booking not found' });
 
     const booking = rows[0];
@@ -673,11 +810,11 @@ app.patch('/api/bookings/:id/assign', authMiddleware, requireRole('Manager'), as
 
     // Notify assigned worker via email
     if (nextWorkerId) {
-      const [workerRows] = await pool.query('SELECT id, email, full_name FROM Users WHERE id = ? AND role = "Worker"', [nextWorkerId]);
+      const [workerRows] = await db('SELECT id, email, full_name FROM Users WHERE id = ? AND role = \'Worker\'', [nextWorkerId]);
       if (workerRows.length > 0) {
         sendMail(workerRows[0].email, `New Assignment: ${booking.order_id || '#' + booking.id}`, `
           <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
-            <h2 style="color:#1e40af">🔧 New Work Assignment</h2>
+            <h2 style="color:#1e40af">New Work Assignment</h2>
             <p>Hi <b>${workerRows[0].full_name}</b>, you have been assigned a new booking:</p>
             <table style="width:100%;border-collapse:collapse;margin:16px 0">
               <tr><td style="padding:8px;color:#6b7280">Order ID</td><td style="padding:8px;font-weight:600;color:#1e40af">${booking.order_id || '#' + booking.id}</td></tr>
@@ -737,8 +874,8 @@ app.patch('/api/bookings/:id/assign', authMiddleware, requireRole('Manager'), as
 // ── List workers (all statuses) ────────────────────────────
 app.get('/api/workers', authMiddleware, requireRole('Manager'), async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT id, email, full_name, phone, approval_status, created_at FROM Users WHERE role = "Worker" ORDER BY created_at DESC'
+    const [rows] = await db(
+      'SELECT id, email, full_name, phone, approval_status, created_at FROM Users WHERE role = \'Worker\' ORDER BY created_at DESC'
     );
     res.json(rows);
   } catch (err) {
@@ -750,8 +887,8 @@ app.get('/api/workers', authMiddleware, requireRole('Manager'), async (req, res)
 // ── List approved workers (for assigning) ──────────────────
 app.get('/api/workers/approved', authMiddleware, requireRole('Manager', 'Worker'), async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT id, email, full_name, phone FROM Users WHERE role = "Worker" AND approval_status = "Approved"'
+    const [rows] = await db(
+      'SELECT id, email, full_name, phone FROM Users WHERE role = \'Worker\' AND approval_status = \'Approved\''
     );
     res.json(rows);
   } catch (err) {
@@ -767,8 +904,8 @@ app.patch('/api/workers/:id/approval', authMiddleware, requireRole('Manager'), a
       return res.status(400).json({ error: 'Status must be Approved or Rejected' });
     }
 
-    await pool.query('UPDATE Users SET approval_status = ? WHERE id = ? AND role = "Worker"', [status, req.params.id]);
-    const [rows] = await pool.query('SELECT id, email, full_name, phone, approval_status FROM Users WHERE id = ?', [req.params.id]);
+    await db('UPDATE Users SET approval_status = ? WHERE id = ? AND role = \'Worker\'', [status, req.params.id]);
+    const [rows] = await db('SELECT id, email, full_name, phone, approval_status FROM Users WHERE id = ?', [req.params.id]);
 
     if (rows.length > 0) {
       const worker = rows[0];
@@ -777,7 +914,7 @@ app.patch('/api/workers/:id/approval', authMiddleware, requireRole('Manager'), a
         : 'Your worker account has been <b style="color:#ef4444">rejected</b>.';
       sendMail(worker.email, `Account ${status} — Garage Services`, `
         <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;border:1px solid #e5e7eb;border-radius:12px">
-          <h2 style="color:#1e40af">🔧 Garage Services</h2>
+          <h2 style="color:#1e40af">Garage Services</h2>
           <p>Hi <b>${worker.full_name}</b>,</p>
           <p>${statusMsg}</p>
         </div>
@@ -796,7 +933,7 @@ app.patch('/api/workers/:id/approval', authMiddleware, requireRole('Manager'), a
 // ════════════════════════════════════════════════════════════
 app.get('/api/settings', authMiddleware, async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT setting_key, setting_value FROM Settings');
+    const [rows] = await db('SELECT setting_key, setting_value FROM Settings');
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -807,10 +944,17 @@ app.put('/api/settings', authMiddleware, requireRole('Manager'), async (req, res
   try {
     const entries = Object.entries(req.body);
     for (const [key, value] of entries) {
-      await pool.query(
-        'INSERT INTO Settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?',
-        [key, value, value]
-      );
+      if (isPostgres) {
+        await dbPool.query(
+          'INSERT INTO Settings (setting_key, setting_value) VALUES ($1, $2) ON CONFLICT (setting_key) DO UPDATE SET setting_value = $3, updated_at = NOW()',
+          [key, value, value]
+        );
+      } else {
+        await db(
+          'INSERT INTO Settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?',
+          [key, value, value]
+        );
+      }
     }
     res.json({ message: 'Settings saved' });
   } catch (err) {
@@ -827,7 +971,7 @@ app.post('/api/feedback', authMiddleware, async (req, res) => {
     if (!customerName || !email || !rating || !comments) {
       return res.status(400).json({ error: 'All feedback fields are required' });
     }
-    await pool.query(
+    await db(
       'INSERT INTO CustomerFeedback (user_id, name, feedback_text, rating) VALUES (?, ?, ?, ?)',
       [req.user.id, customerName, comments, rating]
     );
@@ -840,7 +984,7 @@ app.post('/api/feedback', authMiddleware, async (req, res) => {
 // ── List all feedback (Manager only) ───────────────────────
 app.get('/api/feedback', authMiddleware, requireRole('Manager'), async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM CustomerFeedback ORDER BY feedback_date DESC');
+    const [rows] = await db('SELECT * FROM CustomerFeedback ORDER BY feedback_date DESC');
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: 'Server error' });
@@ -861,9 +1005,15 @@ if (fs.existsSync(distPath)) {
 // ── Start ──────────────────────────────────────────────────
 async function startServer() {
   try {
-    await ensureNotificationsTable();
+    if (isPostgres) {
+      console.log('  Using PostgreSQL (Render)...');
+      await initPostgresTables();
+    } else {
+      console.log('  Using MySQL (local)...');
+      await ensureNotificationsTable();
+    }
     const server = app.listen(PORT, () => {
-      console.log(`\n  🔧  Garage Services API running on http://localhost:${PORT}\n`);
+      console.log(`\n  Garage Services API running on http://localhost:${PORT}\n`);
       try {
         fs.writeFileSync(portFile, String(PORT), 'utf8');
         fs.writeFileSync(pidFile, String(process.pid), 'utf8');

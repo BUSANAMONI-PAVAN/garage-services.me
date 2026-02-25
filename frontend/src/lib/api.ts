@@ -1,6 +1,11 @@
 import axios from 'axios';
 
-const api = axios.create({ baseURL: '/api' });
+// In production, call the Render backend directly. In dev, Vite proxies /api to localhost:5000.
+const API_BASE = import.meta.env.PROD
+  ? 'https://garage-services-api.onrender.com/api'
+  : '/api';
+
+const api = axios.create({ baseURL: API_BASE });
 
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
