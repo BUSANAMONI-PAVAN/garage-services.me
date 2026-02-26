@@ -69,3 +69,12 @@ tmpclaude-*-cwd
 nul
 .server-pid
 .server-port
+.server-log
+
+# Frontend build output
+frontend/dist/
+frontend/node_modules/
+
+# Temp files
+temp-server.out
+temp-server.err
